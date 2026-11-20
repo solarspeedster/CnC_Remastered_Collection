@@ -85,6 +85,29 @@ index 195e6f4..2684ac3 100644
      if (ProgramPath.empty()) {
          /*
          ** Adapted from https://github.com/gpakosz/whereami
+diff --git a/common/settings.cpp b/common/settings.cpp
+index 3b14cfc..3cb7fe8 100644
+--- a/common/settings.cpp
++++ b/common/settings.cpp
+@@ -28,6 +28,18 @@ SettingsClass::SettingsClass()
+     Video.BoxingAspectRatio = "16:10";
+     Video.FrameLimit = 120;
+     Video.InterpolationMode = 2;
++
++#ifdef __EMSCRIPTEN__
++    /*
++    ** Browser defaults: draw into the page's canvas (no fullscreen request) and
++    ** use the normal absolute mouse instead of pointer lock / raw input.
++    */
++    Mouse.RawInput = false;
++    Video.Windowed = true;
++    Video.WindowWidth = 1280;
++    Video.WindowHeight = 800;
++    Video.FrameLimit = 60;
++#endif
+     Video.HardwareCursor = false;
+     Video.DOSMode = false;
+     Video.Scaler = "nearest";
 diff --git a/common/timer.cpp b/common/timer.cpp
 index ea6a5c0..bd11186 100644
 --- a/common/timer.cpp
@@ -233,6 +256,28 @@ index a26cf46..9c9864c 100644
      if(BUILD_WITH_UBSAN)
          target_compile_options(VanillaTD PUBLIC
                      -fsanitize=undefined,float-divide-by-zero,integer,implicit-conversion,implicit-integer-truncation,implicit-integer-arithmetic-value-change,local-bounds,nullability
+diff --git a/tiberiandawn/conquer.cpp b/tiberiandawn/conquer.cpp
+index a8aebd8..e6753e7 100644
+--- a/tiberiandawn/conquer.cpp
++++ b/tiberiandawn/conquer.cpp
+@@ -59,6 +59,7 @@
+  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+ 
+ #include "function.h"
++#include "common/webyield.h"
+ #include "common/irandom.h"
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -1208,6 +1209,9 @@ bool Color_Cycle(void)
+  *=============================================================================================*/
+ void Call_Back(void)
+ {
++    // Several loops spin on Call_Back() waiting for audio to finish; the
++    // browser only advances audio state when we yield to it.
++    Web_Yield();
+ #ifndef DEMO
+     int i;
+     int id;
 diff --git a/tiberiandawn/startup.cpp b/tiberiandawn/startup.cpp
 index 8536cc9..b29032f 100644
 --- a/tiberiandawn/startup.cpp
@@ -274,10 +319,10 @@ index 0000000..f91579b
 +cmake --build build-web --target VanillaTD
 diff --git a/web/shell.html b/web/shell.html
 new file mode 100644
-index 0000000..8f46154
+index 0000000..d27fec2
 --- /dev/null
 +++ b/web/shell.html
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,136 @@
 +<!doctype html>
 +<html lang="en">
 +<head>
@@ -286,7 +331,8 @@ index 0000000..8f46154
 +<title>Vanilla Conquer (browser build)</title>
 +<style>
 +  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 15px/1.4 system-ui, sans-serif; }
-+  #canvas { display: block; margin: 0 auto; max-width: 100vw; max-height: 100vh; image-rendering: pixelated; outline: none; }
++  /* SDL sets an inline size; scale the canvas to fit the window, keeping 16:10. */
++  #canvas { display: block; margin: 0 auto; width: min(100vw, calc(100vh * 1.6)) !important; height: auto !important; outline: none; }
 +  #setup { max-width: 560px; margin: 10vh auto; padding: 24px; background: #1b1b1b; border: 1px solid #333; border-radius: 8px; }
 +  #setup h1 { font-size: 20px; margin: 0 0 12px; }
 +  #setup code { background: #333; padding: 1px 4px; border-radius: 3px; }
