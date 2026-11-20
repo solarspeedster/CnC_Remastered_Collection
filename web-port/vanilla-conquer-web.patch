@@ -1,0 +1,415 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8d094fa..3cd3673 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -139,7 +139,16 @@ if(SDL1)
+     set(SDL2 OFF)
+ endif()
+ 
+-if(SDL2)
++if(EMSCRIPTEN)
++    # Browser build: SDL2 and OpenAL come from Emscripten's built-in ports.
++    set(SDL1 OFF)
++    set(SDL2 ON)
++    set(DDRAW OFF)
++    set(DSOUND OFF)
++    add_compile_options(-sUSE_SDL=2)
++    include_directories(SYSTEM ${EMSCRIPTEN_SYSROOT}/include/AL)
++    add_link_options(-sUSE_SDL=2 -lopenal)
++elseif(SDL2)
+     message("Find path is ${CMAKE_FIND_ROOT_PATH}")
+     find_package(SDL2 REQUIRED)
+     list(APPEND VANILLA_LIBS ${SDL2_LIBRARY})
+@@ -152,7 +161,7 @@ if(SDL2)
+     set(DDRAW OFF)
+ endif()
+ 
+-if(OPENAL)
++if(OPENAL AND NOT EMSCRIPTEN)
+     find_package(OpenAL REQUIRED)
+     list(APPEND VANILLA_LIBS OpenAL::OpenAL)
+     set(DSOUND OFF)
+diff --git a/common/mssleep.h b/common/mssleep.h
+index eb1f8eb..e3924d5 100644
+--- a/common/mssleep.h
++++ b/common/mssleep.h
+@@ -6,7 +6,9 @@
+ #ifndef MSSLEEP_H
+ #define MSSLEEP_H
+ 
+-#if defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR)
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++#elif defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR)
+ #include <winbase.h>
+ #elif defined(_WIN32)
+ #include <synchapi.h>
+@@ -25,7 +27,9 @@
+  */
+ static inline void us_sleep(unsigned us)
+ {
+-#ifdef _WIN32
++#if defined(__EMSCRIPTEN__)
++    emscripten_sleep((us + 999) / 1000);
++#elif defined(_WIN32)
+     Sleep((us + 999) / 1000);
+ #else
+     struct timespec ts;
+@@ -40,7 +44,9 @@ static inline void us_sleep(unsigned us)
+  */
+ static inline void ms_sleep(unsigned ms)
+ {
+-#ifdef _WIN32
++#if defined(__EMSCRIPTEN__)
++    emscripten_sleep(ms);
++#elif defined(_WIN32)
+     Sleep(ms);
+ #else
+     struct timespec ts;
+diff --git a/common/paths_posix.cpp b/common/paths_posix.cpp
+index 195e6f4..2684ac3 100644
+--- a/common/paths_posix.cpp
++++ b/common/paths_posix.cpp
+@@ -120,6 +120,14 @@ namespace
+ 
+ const char* PathsClass::Program_Path()
+ {
++#ifdef __EMSCRIPTEN__
++    // Browser build: the page copies the player's game files into /data
++    // in the virtual file system before the game starts.
++    if (ProgramPath.empty()) {
++        ProgramPath = "/data";
++    }
++    return ProgramPath.c_str();
++#endif
+     if (ProgramPath.empty()) {
+         /*
+         ** Adapted from https://github.com/gpakosz/whereami
+diff --git a/common/timer.cpp b/common/timer.cpp
+index ea6a5c0..bd11186 100644
+--- a/common/timer.cpp
++++ b/common/timer.cpp
+@@ -39,6 +39,11 @@
+  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+ 
+ #include "timer.h"
++#include "webyield.h"
++
++#ifdef __EMSCRIPTEN__
++bool Web_Yield_Enabled = false;
++#endif
+ 
+ #include <chrono>
+ 
+@@ -299,6 +304,8 @@ unsigned int WinTimerClass::Get_User_Tick_Count()
+ 
+ unsigned long long WinTimerClass::Now()
+ {
++    // Many of the original loops busy-wait on a timer; let the browser breathe.
++    Web_Yield();
+     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+ }
+ 
+diff --git a/common/webyield.h b/common/webyield.h
+new file mode 100644
+index 0000000..b24d7f9
+--- /dev/null
++++ b/common/webyield.h
+@@ -0,0 +1,43 @@
++// Browser (Emscripten) build support.
++//
++// The original game code runs its own blocking loops (menus, scenario load,
++// the main game loop) and never returns control to the caller. In a browser
++// the page can only repaint and deliver input when JavaScript returns to the
++// event loop, so with ASYNCIFY we periodically unwind back to the browser.
++//
++// This file is part of a GPL v3 derivative of the EA Command & Conquer source.
++
++#ifndef WEBYIELD_H
++#define WEBYIELD_H
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++
++/**
++ * Give the browser a chance to run (paint, input, audio) if we have been
++ * running for more than a few milliseconds without doing so. Cheap to call
++ * from hot paths such as timer reads and input polls.
++ */
++extern bool Web_Yield_Enabled;
++
++static inline void Web_Yield(bool force = false)
++{
++    // Never unwind before main() runs: static constructors read the timer too
++    // and asyncify cannot suspend inside __wasm_call_ctors.
++    if (!Web_Yield_Enabled) {
++        return;
++    }
++    static double last_yield = 0.0;
++    double now = emscripten_get_now();
++    if (force || now - last_yield > 8.0) {
++        emscripten_sleep(0);
++        last_yield = emscripten_get_now();
++    }
++}
++#else
++static inline void Web_Yield(bool = false)
++{
++}
++#endif
++
++#endif // WEBYIELD_H
+diff --git a/common/wwkeyboard_sdl2.cpp b/common/wwkeyboard_sdl2.cpp
+index 30f1745..d0cda84 100644
+--- a/common/wwkeyboard_sdl2.cpp
++++ b/common/wwkeyboard_sdl2.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "macros.h"
+ #include "wwkeyboard_sdl2.h"
++#include "webyield.h"
+ #include "video.h"
+ #include "sdl_keymap.h"
+ #include "settings.h"
+@@ -31,6 +32,8 @@ WWKeyboardClassSDL2::~WWKeyboardClassSDL2()
+ 
+ void WWKeyboardClassSDL2::Fill_Buffer_From_System(void)
+ {
++    // Input polling loops never return to the browser on their own.
++    Web_Yield();
+ #ifdef NETWORKING
+     Process_Network();
+ #endif
+diff --git a/common/wwstd.h b/common/wwstd.h
+index 5e41f06..8e7ec0c 100644
+--- a/common/wwstd.h
++++ b/common/wwstd.h
+@@ -260,6 +260,7 @@ inline static void _splitpath(const char* path, char* drive, char* dir, char* fn
+     }
+ }
+ 
++#ifndef __EMSCRIPTEN__ // Emscripten's libc already provides strupr.
+ inline static char* strupr(char* str)
+ {
+     char* ret = str;
+@@ -269,6 +270,7 @@ inline static char* strupr(char* str)
+     }
+     return ret;
+ }
++#endif
+ 
+ inline static void strrev(char* str)
+ {
+diff --git a/tiberiandawn/CMakeLists.txt b/tiberiandawn/CMakeLists.txt
+index a26cf46..9c9864c 100644
+--- a/tiberiandawn/CMakeLists.txt
++++ b/tiberiandawn/CMakeLists.txt
+@@ -244,6 +244,28 @@ if(BUILD_VANILLATD)
+     if(WIN32 AND NOT MSVC)
+         set_target_properties(VanillaTD PROPERTIES LINK_FLAGS "-mwindows")
+     endif()
++    if(EMSCRIPTEN)
++        # Browser build: emit vanillatd.html/.js/.wasm. ASYNCIFY lets the
++        # original blocking game loops yield to the browser (see webyield.h).
++        set_target_properties(VanillaTD PROPERTIES SUFFIX ".html")
++        # Strip debug info from the shipped wasm; pass e.g. --profiling-funcs to keep names.
++        if(NOT DEFINED VC_WEB_DEBUG_FLAG)
++            set(VC_WEB_DEBUG_FLAG -g0)
++        endif()
++        target_link_options(VanillaTD PRIVATE
++            -sASYNCIFY
++            -sASYNCIFY_STACK_SIZE=131072
++            -sALLOW_MEMORY_GROWTH=1
++            -sINITIAL_MEMORY=64MB
++            -sSTACK_SIZE=2MB
++            -sFORCE_FILESYSTEM=1
++            -sEXIT_RUNTIME=1
++            -sEXPORTED_RUNTIME_METHODS=FS,IDBFS,addRunDependency,removeRunDependency
++            -lidbfs.js
++            ${VC_WEB_DEBUG_FLAG}
++            --shell-file ${CMAKE_SOURCE_DIR}/web/shell.html)
++        set_property(TARGET VanillaTD APPEND PROPERTY LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/shell.html)
++    endif()
+     if(BUILD_WITH_UBSAN)
+         target_compile_options(VanillaTD PUBLIC
+                     -fsanitize=undefined,float-divide-by-zero,integer,implicit-conversion,implicit-integer-truncation,implicit-integer-arithmetic-value-change,local-bounds,nullability
+diff --git a/tiberiandawn/startup.cpp b/tiberiandawn/startup.cpp
+index 8536cc9..b29032f 100644
+--- a/tiberiandawn/startup.cpp
++++ b/tiberiandawn/startup.cpp
+@@ -37,6 +37,7 @@
+ #include "function.h"
+ #include "common/ini.h"
+ #include "common/paths.h"
++#include "common/webyield.h"
+ #include "common/utfargs.h"
+ #include "settings.h"
+ 
+@@ -200,6 +201,10 @@ int DLL_Startup(const char* command_line_in)
+ 
+ int main(int argc, char** argv)
+ {
++#ifdef __EMSCRIPTEN__
++    // Static construction is done; from here on the game may yield to the browser.
++    Web_Yield_Enabled = true;
++#endif
+     UtfArgs args(argc, argv);
+     CCDebugString("C&C95 - Starting up.\n");
+ 
+diff --git a/web/build.sh b/web/build.sh
+new file mode 100755
+index 0000000..f91579b
+--- /dev/null
++++ b/web/build.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++# Build the browser (WebAssembly) version of Vanilla TD.
++# Needs an activated emsdk (https://emscripten.org). Output: build-web/vanillatd.{html,js,wasm}
++# Serve build-web/ over http(s) and open vanillatd.html in Chrome. No game data is included;
++# the page asks the player for their own original data files and keeps them in IndexedDB.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++emcmake cmake -B build-web -G Ninja -DCMAKE_BUILD_TYPE=Release \
++    -DBUILD_VANILLARA=OFF -DNETWORKING=OFF "$@"
++cmake --build build-web --target VanillaTD
+diff --git a/web/shell.html b/web/shell.html
+new file mode 100644
+index 0000000..8f46154
+--- /dev/null
++++ b/web/shell.html
+@@ -0,0 +1,135 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Vanilla Conquer (browser build)</title>
++<style>
++  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 15px/1.4 system-ui, sans-serif; }
++  #canvas { display: block; margin: 0 auto; max-width: 100vw; max-height: 100vh; image-rendering: pixelated; outline: none; }
++  #setup { max-width: 560px; margin: 10vh auto; padding: 24px; background: #1b1b1b; border: 1px solid #333; border-radius: 8px; }
++  #setup h1 { font-size: 20px; margin: 0 0 12px; }
++  #setup code { background: #333; padding: 1px 4px; border-radius: 3px; }
++  #setup button, #setup label.btn { display: inline-block; margin: 12px 8px 0 0; padding: 8px 14px; background: #3a6; color: #fff; border: 0; border-radius: 4px; cursor: pointer; font: inherit; }
++  #setup input[type=file] { display: none; }
++  #status { margin-top: 12px; color: #aaa; white-space: pre-wrap; }
++  .hidden { display: none !important; }
++</style>
++</head>
++<body>
++<div id="setup" class="hidden">
++  <h1>Load your game files</h1>
++  <p>This build ships no game data. Pick the folder that holds your own copy of the original
++  Tiberian Dawn data files (for example <code>CONQUER.MIX</code>, <code>GENERAL.MIX</code>,
++  <code>DESERT.MIX</code>, <code>TEMPERAT.MIX</code>, <code>WINTER.MIX</code>, <code>SOUNDS.MIX</code>,
++  <code>SPEECH.MIX</code>, <code>LOCAL.MIX</code>, <code>UPDATE.MIX</code>, <code>UPDATEC.MIX</code>, <code>TRANSIT.MIX</code>).</p>
++  <p>The files stay in this browser (IndexedDB). Nothing is uploaded.</p>
++  <label class="btn">Choose folder<input id="pickdir" type="file" webkitdirectory multiple></label>
++  <label class="btn">Choose files<input id="pickfiles" type="file" multiple></label>
++  <button id="play" class="hidden">Play</button>
++  <button id="forget" class="hidden">Forget stored files</button>
++  <div id="status"></div>
++</div>
++<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
++<script>
++  const DATA_DIR = '/data';
++  const setupEl = document.getElementById('setup');
++  const statusEl = document.getElementById('status');
++  const canvas = document.getElementById("canvas");
++
++  function syncfs(populate) {
++    return new Promise((resolve, reject) => FS.syncfs(populate, err => err ? reject(err) : resolve()));
++  }
++
++  function haveData() {
++    try { return FS.readdir(DATA_DIR).some(n => n.toUpperCase() === 'CONQUER.MIX'); } catch (e) { return false; }
++  }
++
++  function waitForFiles() {
++    return new Promise(resolve => {
++      setupEl.classList.remove('hidden');
++      canvas.classList.add('hidden');
++      async function onPick(ev) {
++        const files = Array.from(ev.target.files);
++        let n = 0;
++        for (const f of files) {
++          const name = f.name.toUpperCase();
++          if (!/\.(MIX|INI|AUD|VQA|VQP|PAL|SHP|CPS|ENG|BIN)$/.test(name)) continue;
++          statusEl.textContent = 'Copying ' + name + ' ...';
++          const buf = new Uint8Array(await f.arrayBuffer());
++          FS.writeFile(DATA_DIR + '/' + name, buf);
++          n++;
++        }
++        if (!haveData()) {
++          statusEl.textContent = 'Copied ' + n + ' files, but CONQUER.MIX was not among them. Try again with the folder that contains it.';
++          return;
++        }
++        statusEl.textContent = 'Saving ' + n + ' files in this browser ...';
++        await syncfs(false);
++        setupEl.classList.add('hidden');
++        canvas.classList.remove('hidden');
++        canvas.focus();
++        resolve();
++      }
++      document.getElementById('pickdir').onchange = onPick;
++      document.getElementById('pickfiles').onchange = onPick;
++    });
++  }
++
++  document.getElementById('forget').onclick = async () => {
++    for (const n of FS.readdir(DATA_DIR)) { if (n !== '.' && n !== '..') FS.unlink(DATA_DIR + '/' + n); }
++    await syncfs(false);
++    location.reload();
++  };
++
++  // Browsers only allow audio after a user gesture, so start on a click.
++  function waitForClick() {
++    return new Promise(resolve => {
++      setupEl.classList.remove('hidden');
++      canvas.classList.add('hidden');
++      setupEl.querySelector('h1').textContent = 'Ready';
++      setupEl.querySelectorAll('p, label.btn').forEach(e => e.classList.add('hidden'));
++      const play = document.getElementById('play');
++      play.classList.remove('hidden');
++      document.getElementById('forget').classList.remove('hidden');
++      play.onclick = () => {
++        setupEl.classList.add('hidden');
++        canvas.classList.remove('hidden');
++        canvas.focus();
++        resolve();
++      };
++    });
++  }
++
++  var Module = {
++    canvas: canvas,
++    print: (t) => console.log(t),
++    printErr: (t) => console.warn(t),
++    preRun: [function () {
++      FS.mkdir(DATA_DIR);
++      FS.mount(IDBFS, {}, DATA_DIR);
++      FS.mkdirTree('/home/web_user/.config/vanilla-conquer');
++      FS.mount(IDBFS, {}, '/home/web_user/.config/vanilla-conquer');
++      addRunDependency('game-data');
++      syncfs(true)
++        .then(() => haveData() ? waitForClick() : waitForFiles())
++        .then(() => removeRunDependency('game-data'))
++        .catch(e => { statusEl.textContent = 'Storage error: ' + e; });
++    }],
++    // Persist settings and saved games, and explain an early exit.
++    onExit: (code) => {
++      FS.syncfs(false, () => {});
++      canvas.classList.add('hidden');
++      setupEl.classList.remove('hidden');
++      setupEl.querySelector('h1').textContent = 'The game stopped (exit code ' + code + ')';
++      statusEl.textContent = code ? 'If this happened right away, some game files are probably missing. ' +
++        'Use "Forget stored files" and pick the folder again.' : '';
++      document.getElementById('forget').classList.remove('hidden');
++    },
++  };
++  window.addEventListener('beforeunload', () => { try { FS.syncfs(false, () => {}); } catch (e) {} });
++  setInterval(() => { try { FS.syncfs(false, () => {}); } catch (e) {} }, 10000);
++</script>
++{{{ SCRIPT }}}
++</body>
++</html>
